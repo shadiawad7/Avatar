@@ -1,12 +1,8 @@
 'use client'
 
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import type { AvatarConfig } from '@/types/avatar'
 import type { ConversationState } from '@/types/conversation'
-
-/* =======================
-   TIPOS
-======================= */
 
 type Message = {
   role: 'user' | 'assistant'
@@ -14,7 +10,7 @@ type Message = {
 }
 
 type UseContinuousConversationOptions = {
-  avatar: AvatarConfig
+  avatar?: AvatarConfig
   personalityId: string
   silenceTimeout?: number
 }
@@ -33,193 +29,419 @@ type UseContinuousConversationReturn = {
   resetConversation: () => void
 }
 
-/* =======================
-   HOOK
-======================= */
-
 export function useContinuousConversation(
   options: UseContinuousConversationOptions
 ): UseContinuousConversationReturn {
-  const { personalityId, silenceTimeout = 1800 } = options
+  const { personalityId, silenceTimeout = 1300 } = options
 
   const [state, setState] = useState<ConversationState>('idle')
   const [error, setError] = useState<string | null>(null)
-  const [audioEnergy] = useState(0)
+  const [audioEnergy, setAudioEnergy] = useState(0)
   const [isPaused, setIsPaused] = useState(true)
   const [interimTranscript, setInterimTranscript] = useState('')
+  const [isSupported, setIsSupported] = useState(false)
 
+  const stateRef = useRef<ConversationState>('idle')
+  const isPausedRef = useRef(true)
   const messagesRef = useRef<Message[]>([])
   const recognitionRef = useRef<any>(null)
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null)
+  const finalBufferRef = useRef('')
+  const sendToBackendRef = useRef<(text: string) => Promise<void>>(async () => {})
 
-  const isSupported =
-    typeof window !== 'undefined' &&
-    ((window as any).SpeechRecognition ||
-      (window as any).webkitSpeechRecognition)
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const audioUrlRef = useRef<string | null>(null)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const analyserRef = useRef<AnalyserNode | null>(null)
+  const sourceRef = useRef<MediaElementAudioSourceNode | null>(null)
+  const energyRafRef = useRef<number | null>(null)
+  const isStoppingRef = useRef(false)
 
-  /* =======================
-     UTILIDADES
-  ======================= */
+  useEffect(() => {
+    setIsSupported(
+      !!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition)
+    )
+  }, [])
 
-  const clearSilenceTimer = () => {
+  const setConversationState = useCallback((next: ConversationState) => {
+    stateRef.current = next
+    setState(next)
+  }, [])
+
+  const clearSilenceTimer = useCallback(() => {
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current)
       silenceTimerRef.current = null
     }
-  }
-
-  const resetConversation = useCallback(() => {
-    messagesRef.current = []
-    setInterimTranscript('')
-    setState('idle')
-    setError(null)
   }, [])
 
-  /* =======================
-     BACKEND
-  ======================= */
+  const stopEnergyLoop = useCallback(() => {
+    if (energyRafRef.current) {
+      cancelAnimationFrame(energyRafRef.current)
+      energyRafRef.current = null
+    }
+    setAudioEnergy(0)
+  }, [])
 
-  const sendToBackend = async (userText: string) => {
-    try {
-      setState('thinking')
+  const ensureAudioAnalyser = useCallback((audio: HTMLAudioElement) => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContext()
+    }
+    if (!sourceRef.current) {
+      sourceRef.current = audioContextRef.current.createMediaElementSource(audio)
+    }
+    if (!analyserRef.current) {
+      analyserRef.current = audioContextRef.current.createAnalyser()
+      analyserRef.current.fftSize = 1024
+      sourceRef.current.connect(analyserRef.current)
+      analyserRef.current.connect(audioContextRef.current.destination)
+    }
+  }, [])
 
-      messagesRef.current.push({
-        role: 'user',
-        content: userText,
-      })
+  const startEnergyLoop = useCallback(() => {
+    if (!analyserRef.current) return
+    const analyser = analyserRef.current
+    const data = new Uint8Array(analyser.fftSize)
 
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: messagesRef.current,
-          personalityId,
-        }),
-      })
-
-      if (!res.ok) {
-        throw new Error('Chat API error')
+    const tick = () => {
+      analyser.getByteTimeDomainData(data)
+      let sum = 0
+      for (let i = 0; i < data.length; i++) {
+        const value = (data[i] - 128) / 128
+        sum += value * value
       }
-
-      const data = await res.json()
-
-      messagesRef.current.push({
-        role: 'assistant',
-        content: data.message,
-      })
-
-      speakResponse(data.message)
-    } catch (err) {
-      console.error(err)
-      setError('Error al generar respuesta')
-      setState('idle')
-    }
-  }
-
-  /* =======================
-     TEXT TO SPEECH
-  ======================= */
-
-  const speakResponse = (text: string) => {
-    if (!window.speechSynthesis) return
-
-    setState('speaking')
-
-    const utterance = new SpeechSynthesisUtterance(text)
-    utterance.lang = 'es-ES'
-
-    utterance.onend = () => {
-      setState('listening')
+      const rms = Math.sqrt(sum / data.length)
+      setAudioEnergy(Math.min(1, rms * 3))
+      energyRafRef.current = requestAnimationFrame(tick)
     }
 
-    window.speechSynthesis.cancel()
-    window.speechSynthesis.speak(utterance)
-  }
+    tick()
+  }, [])
 
-  const stopSpeaking = () => {
-    window.speechSynthesis.cancel()
-    setState('idle')
-  }
+  const stopRecognition = useCallback(() => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.onend = null
+        recognitionRef.current.stop()
+      } catch {
+        // noop
+      }
+      recognitionRef.current = null
+    }
+  }, [])
 
-  /* =======================
-     SPEECH RECOGNITION
-  ======================= */
+  const stopSpeaking = useCallback(() => {
+    isStoppingRef.current = true
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel()
+    }
+    if (audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current.currentTime = 0
+      audioRef.current.src = ''
+      try {
+        audioRef.current.load()
+      } catch {
+        // noop
+      }
+    }
+    if (audioUrlRef.current) {
+      URL.revokeObjectURL(audioUrlRef.current)
+      audioUrlRef.current = null
+    }
+    stopEnergyLoop()
+    if (!isPausedRef.current) {
+      setConversationState('listening')
+    } else {
+      setConversationState('idle')
+    }
+    window.setTimeout(() => {
+      isStoppingRef.current = false
+    }, 0)
+  }, [setConversationState, stopEnergyLoop])
 
-  const startRecognition = () => {
-    if (!isSupported) return
+  const startRecognition = useCallback(() => {
+    if (!isSupported || recognitionRef.current || isPausedRef.current) return
 
     const SpeechRecognitionClass =
-      (window as any).SpeechRecognition ||
-      (window as any).webkitSpeechRecognition
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
 
     const recognition = new SpeechRecognitionClass()
     recognition.lang = 'es-ES'
     recognition.continuous = true
     recognition.interimResults = true
+    recognition.maxAlternatives = 1
 
     recognition.onstart = () => {
-      setState('listening')
+      if (stateRef.current !== 'thinking' && stateRef.current !== 'speaking') {
+        setConversationState('listening')
+      }
     }
 
     recognition.onresult = (event: any) => {
       clearSilenceTimer()
 
       let interim = ''
-      let finalText = ''
+      let finalChunk = ''
 
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const transcript = event.results[i][0].transcript
         if (event.results[i].isFinal) {
-          finalText += transcript
+          finalChunk += `${transcript} `
         } else {
           interim += transcript
         }
       }
 
+      if (finalChunk.trim()) {
+        finalBufferRef.current += `${finalChunk.trim()} `
+      }
+
       setInterimTranscript(interim)
 
-      if (finalText) {
-        setInterimTranscript('')
-        silenceTimerRef.current = setTimeout(() => {
-          sendToBackend(finalText)
+      if (finalBufferRef.current.trim()) {
+        silenceTimerRef.current = setTimeout(async () => {
+          const userText = finalBufferRef.current.trim()
+          finalBufferRef.current = ''
+          setInterimTranscript('')
+          if (!userText) return
+          await sendToBackendRef.current(userText)
         }, silenceTimeout)
       }
     }
 
     recognition.onerror = () => {
       setError('Error de reconocimiento de voz')
-      setState('idle')
+    }
+
+    recognition.onend = () => {
+      recognitionRef.current = null
+      if (!isPausedRef.current && stateRef.current !== 'speaking' && stateRef.current !== 'thinking') {
+        window.setTimeout(() => startRecognition(), 120)
+      }
     }
 
     recognition.start()
     recognitionRef.current = recognition
-  }
+  }, [clearSilenceTimer, isSupported, setConversationState, silenceTimeout])
 
-  /* =======================
-     CONTROLES
-  ======================= */
+  const speakResponse = useCallback(
+    async (text: string) => {
+      setConversationState('speaking')
+      stopRecognition()
+      clearSilenceTimer()
+      const fallbackBrowserTTS = () => {
+        if (!window.speechSynthesis) return
+        const utterance = new SpeechSynthesisUtterance(text)
+        utterance.lang = 'es-ES'
+        utterance.rate = 0.95
+        utterance.pitch = 1
+        utterance.onstart = () => startEnergyLoop()
+        utterance.onend = () => {
+          if (isStoppingRef.current) return
+          stopEnergyLoop()
+          if (!isPausedRef.current) {
+            setConversationState('listening')
+            startRecognition()
+          } else {
+            setConversationState('idle')
+          }
+        }
+        utterance.onerror = () => {
+          stopEnergyLoop()
+          setError('Error al reproducir audio')
+          setConversationState('idle')
+        }
+        window.speechSynthesis.cancel()
+        window.speechSynthesis.speak(utterance)
+      }
 
-  const start = async () => {
+      const res = await fetch('/api/text-to-speech', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, personalityId }),
+      })
+
+      if (!res.ok) {
+        let details = ''
+        try {
+          const errBody = await res.json()
+          details = errBody?.details || errBody?.error || ''
+        } catch {
+          details = await res.text()
+        }
+        throw new Error(
+          details
+            ? `TTS API error (${res.status}): ${details}`
+            : `TTS API error (${res.status})`
+        )
+      }
+
+      const blob = await res.blob()
+      if (blob.size === 0) {
+        fallbackBrowserTTS()
+        return
+      }
+      const url = URL.createObjectURL(blob)
+
+      if (audioUrlRef.current) {
+        URL.revokeObjectURL(audioUrlRef.current)
+      }
+      audioUrlRef.current = url
+
+      const audio = audioRef.current ?? new Audio()
+      audioRef.current = audio
+      ensureAudioAnalyser(audio)
+      audio.src = url
+
+      if (audioContextRef.current?.state === 'suspended') {
+        await audioContextRef.current.resume()
+      }
+
+      audio.onplay = () => {
+        startEnergyLoop()
+      }
+
+      audio.onended = () => {
+        if (isStoppingRef.current) return
+        if (audioUrlRef.current) {
+          URL.revokeObjectURL(audioUrlRef.current)
+          audioUrlRef.current = null
+        }
+        stopEnergyLoop()
+        if (!isPausedRef.current) {
+          setConversationState('listening')
+          startRecognition()
+        } else {
+          setConversationState('idle')
+        }
+      }
+
+      audio.onerror = () => {
+        if (audioUrlRef.current) {
+          URL.revokeObjectURL(audioUrlRef.current)
+          audioUrlRef.current = null
+        }
+        fallbackBrowserTTS()
+      }
+
+      try {
+        await audio.play()
+      } catch {
+        fallbackBrowserTTS()
+      }
+    },
+    [
+      clearSilenceTimer,
+      ensureAudioAnalyser,
+      personalityId,
+      setConversationState,
+      startEnergyLoop,
+      startRecognition,
+      stopEnergyLoop,
+      stopRecognition,
+    ]
+  )
+
+  const sendToBackend = useCallback(
+    async (userText: string) => {
+      try {
+        setConversationState('thinking')
+
+        messagesRef.current.push({
+          role: 'user',
+          content: userText,
+        })
+
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: messagesRef.current,
+            personalityId,
+          }),
+        })
+
+        if (!res.ok) {
+          let details = ''
+          try {
+            const errBody = await res.json()
+            details = errBody?.details || errBody?.error || ''
+          } catch {
+            details = await res.text()
+          }
+          throw new Error(
+            details
+              ? `Chat API error (${res.status}): ${details}`
+              : `Chat API error (${res.status})`
+          )
+        }
+
+        const data = await res.json()
+        const reply = (data.message as string)?.trim()
+        if (!reply) throw new Error('Empty model response')
+
+        messagesRef.current.push({
+          role: 'assistant',
+          content: reply,
+        })
+
+        await speakResponse(reply)
+      } catch (err) {
+        console.error(err)
+        setError('Error al generar respuesta')
+        setConversationState('idle')
+      }
+    },
+    [personalityId, setConversationState, speakResponse]
+  )
+
+  useEffect(() => {
+    sendToBackendRef.current = sendToBackend
+  }, [sendToBackend])
+
+  const resetConversation = useCallback(() => {
+    messagesRef.current = []
+    finalBufferRef.current = ''
+    setInterimTranscript('')
+    setError(null)
+  }, [])
+
+  const start = useCallback(async () => {
     if (!isSupported) return
+    setError(null)
+    isPausedRef.current = false
     setIsPaused(false)
     startRecognition()
-  }
+  }, [isSupported, startRecognition])
 
-  const pause = () => {
-    recognitionRef.current?.stop()
+  const pause = useCallback(() => {
+    isPausedRef.current = true
     setIsPaused(true)
-    setState('idle')
-  }
+    clearSilenceTimer()
+    stopRecognition()
+    stopSpeaking()
+    setConversationState('idle')
+  }, [clearSilenceTimer, setConversationState, stopRecognition, stopSpeaking])
 
-  const resume = async () => {
+  const resume = useCallback(async () => {
     if (!isSupported) return
+    setError(null)
+    isPausedRef.current = false
     setIsPaused(false)
     startRecognition()
-  }
+  }, [isSupported, startRecognition])
 
-  /* =======================
-     RETURN
-  ======================= */
+  useEffect(() => {
+    return () => {
+      clearSilenceTimer()
+      stopRecognition()
+      stopSpeaking()
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => undefined)
+      }
+    }
+  }, [clearSilenceTimer, stopRecognition, stopSpeaking])
 
   return {
     state,

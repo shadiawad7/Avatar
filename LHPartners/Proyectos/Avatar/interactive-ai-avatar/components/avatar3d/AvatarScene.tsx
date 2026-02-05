@@ -2,6 +2,7 @@
 
 import { Canvas } from '@react-three/fiber'
 import { Environment, OrbitControls } from '@react-three/drei'
+import * as THREE from 'three'
 import { Suspense } from 'react'
 import { Avatar3D } from './Avatar3D'
 import type { ConversationState } from '@/types/conversation'
@@ -9,6 +10,7 @@ import type { ConversationState } from '@/types/conversation'
 type Props = {
   modelUrl: string
   conversationState: ConversationState
+  audioEnergy?: number
   frameYOffset?: number
   desiredHeadY?: number
   targetHeight?: number
@@ -21,6 +23,7 @@ type Props = {
 export function AvatarScene({
   modelUrl,
   conversationState,
+  audioEnergy = 0,
   frameYOffset = 0,
   desiredHeadY = 1.28,
   targetHeight = 1.55,
@@ -32,34 +35,38 @@ export function AvatarScene({
   return (
     <div className="w-[220px] h-[280px] overflow-visible">
       <Canvas
-        shadows
-        gl={{ alpha: true, antialias: true }}
+        gl={{
+          alpha: true,
+          antialias: true,
+          outputColorSpace: THREE.SRGBColorSpace,
+          toneMapping: THREE.ACESFilmicToneMapping,
+          toneMappingExposure: 0.85,
+        }}
         style={{ background: 'transparent' }}
         camera={{
           position: [0, cameraY, cameraZ],
           fov: 30,
         }}
       >
-        <ambientLight intensity={0.22} />
+        <ambientLight intensity={0.12} />
         <hemisphereLight
-          intensity={0.55}
+          intensity={0.22}
           color="#f1f5ff"
           groundColor="#2f384a"
         />
         <directionalLight
           position={[1.2, 1.9, 1.4]}
-          intensity={1.35}
+          intensity={0.55}
           color="#fff4dd"
-          castShadow
         />
         <directionalLight
           position={[-1.5, 1.5, 0.8]}
-          intensity={0.55}
+          intensity={0.2}
           color="#cfe2ff"
         />
         <directionalLight
           position={[0, 1.9, -1.8]}
-          intensity={0.35}
+          intensity={0.18}
           color="#b8d1ff"
         />
 
@@ -67,12 +74,13 @@ export function AvatarScene({
           <Avatar3D
             modelUrl={modelUrl}
             conversationState={conversationState}
+            audioEnergy={audioEnergy}
             frameYOffset={frameYOffset}
             desiredHeadY={desiredHeadY}
             targetHeight={targetHeight}
             sizeMultiplier={sizeMultiplier}
           />
-          <Environment preset="studio" />
+          <Environment preset="studio" environmentIntensity={0.6} />
         </Suspense>
 
         <OrbitControls
