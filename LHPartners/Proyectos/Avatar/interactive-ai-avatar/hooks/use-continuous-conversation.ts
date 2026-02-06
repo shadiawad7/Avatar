@@ -199,12 +199,13 @@ export function useContinuousConversation(
 
       setInterimTranscript(interim)
 
-      if (finalBufferRef.current.trim()) {
+      const buffered = finalBufferRef.current.trim()
+      if (buffered.length >= 3 && !isPausedRef.current) {
         silenceTimerRef.current = setTimeout(async () => {
           const userText = finalBufferRef.current.trim()
           finalBufferRef.current = ''
           setInterimTranscript('')
-          if (!userText) return
+          if (!userText || isPausedRef.current) return
           await sendToBackendRef.current(userText)
         }, silenceTimeout)
       }
@@ -230,32 +231,6 @@ export function useContinuousConversation(
       setConversationState('speaking')
       stopRecognition()
       clearSilenceTimer()
-      const fallbackBrowserTTS = () => {
-        if (!window.speechSynthesis) return
-        const utterance = new SpeechSynthesisUtterance(text)
-        utterance.lang = 'es-ES'
-        utterance.rate = 0.95
-        utterance.pitch = 1
-        utterance.onstart = () => startEnergyLoop()
-        utterance.onend = () => {
-          if (isStoppingRef.current) return
-          stopEnergyLoop()
-          if (!isPausedRef.current) {
-            setConversationState('listening')
-            startRecognition()
-          } else {
-            setConversationState('idle')
-          }
-        }
-        utterance.onerror = () => {
-          stopEnergyLoop()
-          setError('Error al reproducir audio')
-          setConversationState('idle')
-        }
-        window.speechSynthesis.cancel()
-        window.speechSynthesis.speak(utterance)
-      }
-
       const res = await fetch('/api/text-to-speech', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -278,10 +253,7 @@ export function useContinuousConversation(
       }
 
       const blob = await res.blob()
-      if (blob.size === 0) {
-        fallbackBrowserTTS()
-        return
-      }
+      if (blob.size === 0) throw new Error('Empty TTS audio')
       const url = URL.createObjectURL(blob)
 
       if (audioUrlRef.current) {
@@ -318,17 +290,24 @@ export function useContinuousConversation(
       }
 
       audio.onerror = () => {
+        if (isPausedRef.current || isStoppingRef.current) return
         if (audioUrlRef.current) {
           URL.revokeObjectURL(audioUrlRef.current)
           audioUrlRef.current = null
         }
-        fallbackBrowserTTS()
+        stopEnergyLoop()
+        setError('Error al reproducir audio')
+        setConversationState('idle')
       }
 
       try {
         await audio.play()
       } catch {
-        fallbackBrowserTTS()
+        if (!isPausedRef.current && !isStoppingRef.current) {
+          stopEnergyLoop()
+          setError('Error al reproducir audio')
+          setConversationState('idle')
+        }
       }
     },
     [
@@ -418,7 +397,10 @@ export function useContinuousConversation(
   const pause = useCallback(() => {
     isPausedRef.current = true
     setIsPaused(true)
+    setError(null)
     clearSilenceTimer()
+    finalBufferRef.current = ''
+    setInterimTranscript('')
     stopRecognition()
     stopSpeaking()
     setConversationState('idle')
@@ -429,6 +411,8 @@ export function useContinuousConversation(
     setError(null)
     isPausedRef.current = false
     setIsPaused(false)
+    finalBufferRef.current = ''
+    setInterimTranscript('')
     startRecognition()
   }, [isSupported, startRecognition])
 
